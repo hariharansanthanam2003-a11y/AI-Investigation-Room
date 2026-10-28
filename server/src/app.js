@@ -1,8 +1,12 @@
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
+import MongoStore from 'connect-mongo';
 import { rateLimit } from 'express-rate-limit';
 import mongoose from 'mongoose';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { env } from './config/env.js';
 import Case from './models/Case.js';
 import { createCaseSchema, accusationSchema } from './validators/case.js';
@@ -13,7 +17,14 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(cors({ origin: env.clientOrigin, credentials: true }));
 app.use(express.json({ limit: '32kb' }));
-app.use(session({ name: 'mystery.sid', secret: env.sessionSecret, resave: false, saveUninitialized: true, cookie: { httpOnly: true, sameSite: 'lax', secure: env.nodeEnv === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 } }));
+app.use(session({
+  name: 'mystery.sid',
+  secret: env.sessionSecret,
+  resave: false,
+  saveUninitialized: true,
+  store: MongoStore.create({ mongoUrl: env.mongoUri, collectionName: 'sessions' }),
+  cookie: { httpOnly: true, sameSite: 'lax', secure: env.nodeEnv === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 },
+}));
 app.use('/api/v1', (req, _res, next) => { if (!req.session.ownerId) req.session.ownerId = crypto.randomUUID(); next(); });
 const api = express.Router();
 api.get('/health', (_req, res) => res.json({ success: true, data: { live: true, database: mongoose.connection.readyState === 1 ? 'ready' : 'unavailable' }, error: null }));
@@ -33,5 +44,14 @@ api.get('/cases/:caseId/evidence/:evidenceId', async (req, res, next) => { try {
 api.post('/cases/:caseId/accusations', async (req, res, next) => { try { const { suspectId } = accusationSchema.parse(req.body); const doc = await Case.findOne({ _id: req.params.caseId, sessionId: req.session.ownerId }); if (!doc) return res.status(404).json({ success: false, data: null, error: { code: 'NOT_FOUND', message: 'Case not found.' } }); if (!doc.suspects.some(s => s.id === suspectId)) return res.status(422).json({ success: false, data: null, error: { code: 'INVALID_SUSPECT', message: 'Choose a suspect from this case.' } }); if (doc.accusation?.submittedAt) return res.status(409).json({ success: false, data: null, error: { code: 'ALREADY_SUBMITTED', message: 'An accusation has already been submitted.' } }); doc.accusation = { suspectId, correct: suspectId === doc.solution.culpritSuspectId, submittedAt: new Date() }; doc.status = 'solved'; await doc.save(); res.json({ success: true, data: resultCase(doc), error: null }); } catch (e) { next(e); } });
 api.get('/cases/:caseId/result', async (req, res, next) => { try { const doc = await Case.findOne({ _id: req.params.caseId, sessionId: req.session.ownerId }); if (!doc) return res.status(404).json({ success: false, data: null, error: { code: 'NOT_FOUND', message: 'Case not found.' } }); if (!doc.accusation?.submittedAt) return res.status(403).json({ success: false, data: null, error: { code: 'NOT_SOLVED', message: 'Submit an accusation before revealing the solution.' } }); res.json({ success: true, data: resultCase(doc), error: null }); } catch (e) { next(e); } });
 app.use('/api/v1', api);
+const clientDist = resolve(dirname(fileURLToPath(import.meta.url)), '../../client/dist');
+if (existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    res.sendFile(resolve(clientDist, 'index.html'));
+  });
+}
+app.use('/api', (_req, res) => res.status(404).json({ success: false, data: null, error: { code: 'NOT_FOUND', message: 'API route not found.' } }));
 app.use((err, _req, res, _next) => { const status = err.status || (err.name === 'ZodError' ? 400 : 500); if (status >= 500) console.error('API error:', err.message); res.status(status).json({ success: false, data: null, error: { code: err.code || (status === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR'), message: status === 400 ? 'Please check your input and try again.' : err.status ? err.message : 'An unexpected error occurred.' } }); });
 export default app;
